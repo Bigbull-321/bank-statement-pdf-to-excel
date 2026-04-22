@@ -10,16 +10,16 @@ from pdf2image import convert_from_bytes
 import os
 
 # -------------------------------
-# Config paths for Cloud (Linux)
+# Config paths for OCR
 # -------------------------------
-pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
-poppler_path = None
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+poppler_path = r"C:\Users\Admin\Downloads\Release-25.11.0-0\poppler-25.11.0\Library\bin"
 
 # -------------------------------
 # Streamlit page config
 # -------------------------------
 st.set_page_config(page_title="Bank PDF to Excel Converter", layout="centered")
-st.title("🏦 Bank Statement PDF → Excel Converter")
+st.title("Bank Statement PDF → Excel Converter")
 st.write("Upload your Canara, Union, Axis, HDFC, Kotak, BOI, ICICI, or SBI Bank PDF statement.")
 
 uploaded_file = st.file_uploader("Drag and Drop PDF Here", type=["pdf"])
@@ -31,10 +31,9 @@ pdf_password = st.text_input("Enter PDF Password (Leave blank if not required)",
 def open_pdf(uploaded_file, password=None):
     try:
         pdf_bytes = uploaded_file.read()
-        uploaded_file.seek(0)
         pdf_buffer = io.BytesIO(pdf_bytes)
         pdf = pdfplumber.open(pdf_buffer, password=password)
-        return pdf, pdf_bytes
+        return pdf
     except Exception as e:
         raise Exception(f"❌ Could not open PDF. Error: {e}")
 
@@ -79,15 +78,14 @@ def detect_bank_type(rows, pdf):
             return "Kotak Bank"
         elif "ICICI" in first_page_text.upper():
             return "ICICI Bank"
-    return "SBI Bank (OCR)"
+    return "SBI Bank (OCR)"  # Default to OCR if none detected
 
 # =====================================================
-# OPTIMIZED SBI OCR EXTRACTION
+# FIXED SBI OCR EXTRACTION - NO DATE DUPLICATION
 # =====================================================
 def extract_sbi_transactions(pdf_bytes):
     try:
-        # Convert to images with lower DPI for memory efficiency
-        pages = convert_from_bytes(pdf_bytes, dpi=200, poppler_path=poppler_path)
+        pages = convert_from_bytes(pdf_bytes, dpi=300, poppler_path=poppler_path)
     except Exception as e:
         raise Exception(f"❌ Could not convert PDF to images. Error: {e}")
 
@@ -95,10 +93,7 @@ def extract_sbi_transactions(pdf_bytes):
     date_pat = r"\d{2}-\d{2}-\d{4}"
     amount_pat = r"\d{1,3}(?:,\d{2,3})*\.\d{2}"
     
-    progress_bar = st.progress(0)
-    total_pages = len(pages)
-    
-    for idx, page in enumerate(pages):
+    for page in pages:
         img = np.array(page)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)[1]
@@ -157,7 +152,7 @@ def extract_sbi_transactions(pdf_bytes):
                     for amt in transaction_amounts:
                         description = description.replace(amt, "")
                     
-                    # Clean up description
+                    # Clean up description - remove extra spaces and any remaining CR/DR
                     description = re.sub(r'\s+', ' ', description).strip()
                     description = re.sub(r'\bCR\b', '', description, flags=re.IGNORECASE)
                     description = re.sub(r'\bDR\b', '', description, flags=re.IGNORECASE)
@@ -182,6 +177,7 @@ def extract_sbi_transactions(pdf_bytes):
                                     else:
                                         debit = transaction_amounts[0]
                                 except:
+                                    # Default to credit if can't determine
                                     credit = transaction_amounts[0]
                             else:
                                 credit = transaction_amounts[0]
@@ -192,12 +188,7 @@ def extract_sbi_transactions(pdf_bytes):
                             credit = transaction_amounts[1]
                     
                     transactions.append([post_date, value_date, description, "", debit, credit, balance])
-        
-        # Update progress
-        progress_bar.progress((idx + 1) / total_pages)
-    
-    progress_bar.empty()
-    
+
     df = pd.DataFrame(transactions, columns=[
         "Post Date", "Value Date", "Description", "Cheque No/Reference", "Debit", "Credit", "Balance"
     ])
@@ -206,286 +197,233 @@ def extract_sbi_transactions(pdf_bytes):
     return df
 
 # =====================================================
-# BOI BANK PROCESSING
-# =====================================================
-def process_boi_bank(rows):
-    boi_rows = []
-    for row in rows:
-        cleaned = [cell.strip() if cell else "" for cell in row]
-        if "Sr No" in cleaned: 
-            continue
-        if len(cleaned) >= 6:
-            boi_rows.append(cleaned[:6])
-    df = pd.DataFrame(boi_rows, columns=["Sr No", "Date", "Remarks", "Debit", "Credit", "Balance"])
-    for col in ["Debit", "Credit", "Balance"]:
-        df[col] = df[col].str.replace("₹", "", regex=False).str.replace(",", "", regex=False)
-    return df
-
-# =====================================================
-# HDFC BANK PROCESSING
-# =====================================================
-def process_hdfc_bank(pdf):
-    date_re = re.compile(r"^(\d{2}/\d{2}/\d{4})")
-    amount_re = re.compile(r"([\d,]+\.\d{2})")
-    parsed_rows = []
-    current_txn = None
-    for page in pdf.pages:
-        text = page.extract_text()
-        if not text: 
-            continue
-        for line in text.split("\n"):
-            line = line.strip()
-            if not line: 
-                continue
-            date_match = date_re.match(line)
-            amounts = amount_re.findall(line)
-            if date_match and len(amounts) >= 3:
-                if current_txn: 
-                    parsed_rows.append(current_txn)
-                narration_part = line[10:].strip()
-                current_txn = {
-                    "Txn Date": date_match.group(1),
-                    "Narration": narration_part,
-                    "Withdrawals": amounts[-3].replace(",", ""),
-                    "Deposits": amounts[-2].replace(",", ""),
-                    "Closing Balance": amounts[-1].replace(",", "")
-                }
-            else:
-                if current_txn:
-                    current_txn["Narration"] += " " + line
-    if current_txn: 
-        parsed_rows.append(current_txn)
-    return pd.DataFrame(parsed_rows)
-
-# =====================================================
-# KOTAK BANK PROCESSING
-# =====================================================
-def process_kotak_bank(pdf):
-    date_re = re.compile(r"\d{2}\s[A-Za-z]{3}\s\d{4}")
-    amount_re = re.compile(r"[+-]?\d+(?:,\d{2,3})*\.\d{2}")
-    ref_re = re.compile(r"\b(?:MB|UPI|CHQ)[A-Z0-9\-]+\b")
-    time_re = re.compile(r"\d{1,2}:\d{2}\s?(?:AM|PM)")
-    junk_re = re.compile(
-        r"(Statement generated on|Page\s+\d+\s+of\s+\d+|"
-        r"Account Statement|TRANSACTION DATE|VALUE DATE|"
-        r"TRANSACTION DETAILS|CHQ / REF NO|DEBIT/CREDIT|BALANCE|"
-        r"Kotak)", re.IGNORECASE
-    )
-    parsed_rows = []
-    current_txn = None
-    row_no = 0
-    for page in pdf.pages:
-        text = page.extract_text()
-        if not text: 
-            continue
-        for line in text.split("\n"):
-            line = line.strip()
-            if not line or junk_re.search(line): 
-                continue
-            dates = date_re.findall(line)
-            amounts = amount_re.findall(line)
-            if len(dates) >= 2 and len(amounts) >= 2:
-                if current_txn: 
-                    parsed_rows.append(current_txn)
-                row_no += 1
-                txn_date, value_date = dates[0], dates[1]
-                cleaned = line.replace(txn_date, "").replace(value_date, "")
-                cleaned = time_re.sub("", cleaned)
-                ref_match = ref_re.search(cleaned)
-                ref_no = ref_match.group() if ref_match else ""
-                amt_match = re.search(amount_re, cleaned)
-                narration = cleaned[:amt_match.start()] if amt_match else cleaned
-                narration = narration.replace(ref_no, "").strip()
-                current_txn = {
-                    "#": row_no,
-                    "TRANSACTION DATE": txn_date,
-                    "VALUE DATE": value_date,
-                    "TRANSACTION DETAILS": narration,
-                    "CHQ / REF NO.": ref_no,
-                    "DEBIT/CREDIT (₹)": amounts[-2].replace(",", ""),
-                    "BALANCE (₹)": amounts[-1].replace(",", "")
-                }
-            else:
-                if current_txn:
-                    extra = time_re.sub("", line).strip()
-                    if extra and not junk_re.search(extra):
-                        current_txn["TRANSACTION DETAILS"] += " " + extra
-    if current_txn: 
-        parsed_rows.append(current_txn)
-    return pd.DataFrame(parsed_rows)
-
-# =====================================================
-# ICICI BANK PROCESSING
-# =====================================================
-def process_icici_bank(pdf):
-    all_lines = []
-    for page in pdf.pages:
-        text = page.extract_text()
-        if text: 
-            all_lines.extend(text.split("\n"))
-    clean_lines = [l.strip() for l in all_lines if l.strip() and "DATE MODE PARTICULARS" not in l and not l.startswith("Total:")]
-    transactions = []
-    i = 0
-    while i < len(clean_lines):
-        line = clean_lines[i]
-        date_match = re.match(r"\d{2}-\d{2}-\d{4}", line)
-        if date_match:
-            date = date_match.group()
-            remaining = line[len(date):].strip()
-            if remaining.startswith("B/F"):
-                numbers = re.findall(r"\d[\d,]*\.\d{2}", remaining)
-                balance = numbers[0] if numbers else ""
-                transactions.append({"DATE": date, "MODE": "B/F", "PARTICULARS": "", "DEPOSITS": "", "WITHDRAWALS": "", "BALANCE": balance})
-                i += 1
-                continue
-            numbers = re.findall(r"\d[\d,]*\.\d{2}", line)
-            if len(numbers) == 2:
-                amount, balance = numbers
-                particulars = remaining.replace(amount, "").replace(balance, "").strip()
-                transactions.append({"DATE": date, "MODE": "", "PARTICULARS": particulars, "DEPOSITS": "", "WITHDRAWALS": "", "BALANCE": balance})
-                i += 1
-                continue
-            buffer = []
-            i += 1
-            while i < len(clean_lines):
-                next_line = clean_lines[i]
-                nums = re.findall(r"\d[\d,]*\.\d{2}", next_line)
-                if len(nums) == 2:
-                    amount, balance = nums
-                    cleaned = next_line.replace(amount, "").replace(balance, "").strip()
-                    buffer.append(cleaned)
-                    particulars = " ".join(buffer).strip()
-                    transactions.append({"DATE": date, "MODE": "", "PARTICULARS": particulars, "DEPOSITS": "", "WITHDRAWALS": "", "BALANCE": balance})
-                    break
-                else:
-                    buffer.append(next_line)
-                i += 1
-        i += 1
-    df = pd.DataFrame(transactions)
-    for j in range(1, len(df)):
-        try:
-            prev_balance = float(df.loc[j-1, "BALANCE"].replace(",", ""))
-            curr_balance = float(df.loc[j, "BALANCE"].replace(",", ""))
-            amount = abs(curr_balance - prev_balance)
-            amount_str = f"{amount:,.2f}"
-            if curr_balance > prev_balance:
-                df.loc[j, "DEPOSITS"] = amount_str
-            else:
-                df.loc[j, "WITHDRAWALS"] = amount_str
-        except:
-            pass
-    return df[["DATE", "MODE", "PARTICULARS", "DEPOSITS", "WITHDRAWALS", "BALANCE"]]
-
-# =====================================================
 # MAIN PROCESS
 # =====================================================
 if uploaded_file is not None:
-    pdf_name = os.path.splitext(uploaded_file.name)[0]
-    file_size_mb = uploaded_file.size / (1024 * 1024)
-    
-    st.info(f"📄 File: {uploaded_file.name} ({file_size_mb:.2f} MB)")
-    
-    if file_size_mb > 50:
-        st.warning("⚠️ Large PDF detected. Processing may take several minutes...")
-    
+    pdf_name = os.path.splitext(uploaded_file.name)[0]  # Extract PDF name without extension
     with st.spinner("Processing PDF..."):
         try:
-            # Read PDF once
+            # Read PDF bytes
             pdf_bytes = uploaded_file.read()
-            uploaded_file.seek(0)
-            
-            # Try table extraction first
+            uploaded_file.seek(0)  # Reset pointer for reuse
+
+            # Try PDF plumbler first
             try:
-                pdf_buffer = io.BytesIO(pdf_bytes)
-                pdf = pdfplumber.open(pdf_buffer, password=pdf_password if pdf_password else None)
+                pdf = open_pdf(uploaded_file, password=pdf_password if pdf_password else None)
                 rows = extract_tables(pdf)
                 bank_type = detect_bank_type(rows, pdf)
-                pdf.close()
-            except Exception as e:
-                st.warning(f"Table extraction failed: {str(e)[:100]}. Trying OCR...")
-                bank_type = "SBI Bank (OCR)"
+            except:
+                pdf = None
                 rows = []
-            
+                bank_type = "SBI Bank (OCR)"
+
             df = pd.DataFrame()
-            
-            # Process based on bank type
+
+            # -----------------------------
+            # BOI BANK
+            # -----------------------------
             if bank_type == "BOI Bank":
-                df = process_boi_bank(rows)
-                
+                boi_rows = []
+                for row in rows:
+                    cleaned = [cell.strip() if cell else "" for cell in row]
+                    if "Sr No" in cleaned: continue
+                    if len(cleaned) >= 6:
+                        boi_rows.append(cleaned[:6])
+                df = pd.DataFrame(boi_rows, columns=["Sr No", "Date", "Remarks", "Debit", "Credit", "Balance"])
+                for col in ["Debit", "Credit", "Balance"]:
+                    df[col] = df[col].str.replace("₹", "", regex=False).str.replace(",", "", regex=False)
+
+            # -----------------------------
+            # HDFC BANK
+            # -----------------------------
             elif bank_type == "HDFC Bank":
-                pdf_buffer = io.BytesIO(pdf_bytes)
-                pdf = pdfplumber.open(pdf_buffer, password=pdf_password if pdf_password else None)
-                df = process_hdfc_bank(pdf)
-                pdf.close()
-                
+                date_re = re.compile(r"^(\d{2}/\d{2}/\d{4})")
+                amount_re = re.compile(r"([\d,]+\.\d{2})")
+                parsed_rows = []
+                current_txn = None
+                for page in pdf.pages:
+                    text = page.extract_text()
+                    if not text: continue
+                    for line in text.split("\n"):
+                        line = line.strip()
+                        if not line: continue
+                        date_match = date_re.match(line)
+                        amounts = amount_re.findall(line)
+                        if date_match and len(amounts) >= 3:
+                            if current_txn: parsed_rows.append(current_txn)
+                            narration_part = line[10:].strip()
+                            current_txn = {
+                                "Txn Date": date_match.group(1),
+                                "Narration": narration_part,
+                                "Withdrawals": amounts[-3].replace(",", ""),
+                                "Deposits": amounts[-2].replace(",", ""),
+                                "Closing Balance": amounts[-1].replace(",", "")
+                            }
+                        else:
+                            if current_txn:
+                                current_txn["Narration"] += " " + line
+                if current_txn: parsed_rows.append(current_txn)
+                df = pd.DataFrame(parsed_rows)
+
+            # -----------------------------
+            # KOTAK BANK
+            # -----------------------------
             elif bank_type == "Kotak Bank":
-                pdf_buffer = io.BytesIO(pdf_bytes)
-                pdf = pdfplumber.open(pdf_buffer, password=pdf_password if pdf_password else None)
-                df = process_kotak_bank(pdf)
-                pdf.close()
-                
+                date_re = re.compile(r"\d{2}\s[A-Za-z]{3}\s\d{4}")
+                amount_re = re.compile(r"[+-]?\d+(?:,\d{2,3})*\.\d{2}")
+                ref_re = re.compile(r"\b(?:MB|UPI|CHQ)[A-Z0-9\-]+\b")
+                time_re = re.compile(r"\d{1,2}:\d{2}\s?(?:AM|PM)")
+                junk_re = re.compile(
+                    r"(Statement generated on|Page\s+\d+\s+of\s+\d+|"
+                    r"Account Statement|TRANSACTION DATE|VALUE DATE|"
+                    r"TRANSACTION DETAILS|CHQ / REF NO|DEBIT/CREDIT|BALANCE|"
+                    r"Kotak)", re.IGNORECASE
+                )
+                parsed_rows = []
+                current_txn = None
+                row_no = 0
+                for page in pdf.pages:
+                    text = page.extract_text()
+                    if not text: continue
+                    for line in text.split("\n"):
+                        line = line.strip()
+                        if not line or junk_re.search(line): continue
+                        dates = date_re.findall(line)
+                        amounts = amount_re.findall(line)
+                        if len(dates) >= 2 and len(amounts) >= 2:
+                            if current_txn: parsed_rows.append(current_txn)
+                            row_no += 1
+                            txn_date, value_date = dates[0], dates[1]
+                            cleaned = line.replace(txn_date, "").replace(value_date, "")
+                            cleaned = time_re.sub("", cleaned)
+                            ref_match = ref_re.search(cleaned)
+                            ref_no = ref_match.group() if ref_match else ""
+                            amt_match = re.search(amount_re, cleaned)
+                            narration = cleaned[:amt_match.start()] if amt_match else cleaned
+                            narration = narration.replace(ref_no, "").strip()
+                            current_txn = {
+                                "#": row_no,
+                                "TRANSACTION DATE": txn_date,
+                                "VALUE DATE": value_date,
+                                "TRANSACTION DETAILS": narration,
+                                "CHQ / REF NO.": ref_no,
+                                "DEBIT/CREDIT (₹)": amounts[-2].replace(",", ""),
+                                "BALANCE (₹)": amounts[-1].replace(",", "")
+                            }
+                        else:
+                            if current_txn:
+                                extra = time_re.sub("", line).strip()
+                                if extra and not junk_re.search(extra):
+                                    current_txn["TRANSACTION DETAILS"] += " " + extra
+                if current_txn: parsed_rows.append(current_txn)
+                df = pd.DataFrame(parsed_rows)
+
+            # -----------------------------
+            # ICICI BANK
+            # -----------------------------
             elif bank_type == "ICICI Bank":
-                pdf_buffer = io.BytesIO(pdf_bytes)
-                pdf = pdfplumber.open(pdf_buffer, password=pdf_password if pdf_password else None)
-                df = process_icici_bank(pdf)
-                pdf.close()
-                
+                all_lines = []
+                for page in pdf.pages:
+                    text = page.extract_text()
+                    if text: all_lines.extend(text.split("\n"))
+                clean_lines = [l.strip() for l in all_lines if l.strip() and "DATE MODE PARTICULARS" not in l and not l.startswith("Total:")]
+                transactions = []
+                i = 0
+                while i < len(clean_lines):
+                    line = clean_lines[i]
+                    date_match = re.match(r"\d{2}-\d{2}-\d{4}", line)
+                    if date_match:
+                        date = date_match.group()
+                        remaining = line[len(date):].strip()
+                        if remaining.startswith("B/F"):
+                            numbers = re.findall(r"\d[\d,]*\.\d{2}", remaining)
+                            balance = numbers[0] if numbers else ""
+                            transactions.append({"DATE": date, "MODE": "B/F", "PARTICULARS": "", "DEPOSITS": "", "WITHDRAWALS": "", "BALANCE": balance})
+                            i += 1
+                            continue
+                        numbers = re.findall(r"\d[\d,]*\.\d{2}", line)
+                        if len(numbers) == 2:
+                            amount, balance = numbers
+                            particulars = remaining.replace(amount, "").replace(balance, "").strip()
+                            transactions.append({"DATE": date, "MODE": "", "PARTICULARS": particulars, "DEPOSITS": "", "WITHDRAWALS": "", "BALANCE": balance})
+                            i += 1
+                            continue
+                        buffer = []
+                        i += 1
+                        while i < len(clean_lines):
+                            next_line = clean_lines[i]
+                            nums = re.findall(r"\d[\d,]*\.\d{2}", next_line)
+                            if len(nums) == 2:
+                                amount, balance = nums
+                                cleaned = next_line.replace(amount, "").replace(balance, "").strip()
+                                buffer.append(cleaned)
+                                particulars = " ".join(buffer).strip()
+                                transactions.append({"DATE": date, "MODE": "", "PARTICULARS": particulars, "DEPOSITS": "", "WITHDRAWALS": "", "BALANCE": balance})
+                                break
+                            else:
+                                buffer.append(next_line)
+                            i += 1
+                    i += 1
+                df = pd.DataFrame(transactions)
+                for j in range(1, len(df)):
+                    try:
+                        prev_balance = float(df.loc[j-1, "BALANCE"].replace(",", ""))
+                        curr_balance = float(df.loc[j, "BALANCE"].replace(",", ""))
+                        amount = abs(curr_balance - prev_balance)
+                        amount_str = f"{amount:,.2f}"
+                        if curr_balance > prev_balance:
+                            df.loc[j, "DEPOSITS"] = amount_str
+                        else:
+                            df.loc[j, "WITHDRAWALS"] = amount_str
+                    except:
+                        pass
+                df = df[["DATE", "MODE", "PARTICULARS", "DEPOSITS", "WITHDRAWALS", "BALANCE"]]
+
+            # -----------------------------
+            # GENERIC TABLE BANKS (Canara/Union/Axis)
+            # -----------------------------
             elif bank_type in ["Canara Bank", "Union Bank", "Axis Bank"]:
-                if rows:
-                    header = rows[0]
-                    data_rows = rows[1:]
-                    normalized_rows = []
-                    num_cols = len(header)
-                    for row in data_rows:
-                        if len(row) > num_cols:
-                            row = row[:num_cols]
-                        elif len(row) < num_cols:
-                            row += [""] * (num_cols - len(row))
-                        normalized_rows.append(row)
-                    df = pd.DataFrame(normalized_rows, columns=header)
-                    
+                header = rows[0]
+                data_rows = rows[1:]
+                normalized_rows = []
+                num_cols = len(header)
+                for row in data_rows:
+                    if len(row) > num_cols: row = row[:num_cols]
+                    elif len(row) < num_cols: row += [""] * (num_cols - len(row))
+                    normalized_rows.append(row)
+                df = pd.DataFrame(normalized_rows, columns=header)
+
+            # -----------------------------
+            # SBI OCR BANK (FIXED - NO DATE DUPLICATION)
+            # -----------------------------
             elif bank_type == "SBI Bank (OCR)":
                 df = extract_sbi_transactions(pdf_bytes)
-            
-            # Export results
+
+            # -----------------------------
+            # EXPORT
+            # -----------------------------
             if not df.empty:
                 output = io.BytesIO()
                 df.to_excel(output, index=False, engine="openpyxl")
                 output.seek(0)
                 
-                excel_filename = f"{pdf_name}_Statement.xlsx"
+                # Create clean filename
+                base_name = pdf_name.replace(" ", "_")
+                excel_filename = f"{base_name}_Statement.xlsx"
                 
                 st.success(f"✅ {bank_type} statement converted successfully!")
                 st.download_button(
                     label="📥 Download Excel",
                     data=output,
                     file_name=excel_filename,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
                 
-                with st.expander("📊 Preview First 10 Rows"):
-                    st.dataframe(df.head(10), use_container_width=True)
-                
-                # Show summary
-                st.info(f"📈 Total transactions: {len(df)}")
-                
+                # Show preview
+                with st.expander("Preview First 10 Rows"):
+                    st.dataframe(df.head(10))
             else:
-                st.warning("⚠️ No transactions detected. The PDF might be password protected, scanned, or in an unsupported format.")
-                
-        except MemoryError:
-            st.error("❌ Out of memory! The PDF is too large for the free tier.")
-            st.markdown("""
-            **Solutions:**
-            1. Split the PDF into smaller files (under 20MB each)
-            2. Use a lower DPI by modifying the code (change dpi=200 to dpi=150)
-            3. Process locally on your computer instead of cloud
-            """)
+                st.warning("⚠ No transactions detected.")
+
         except Exception as e:
-            st.error(f"❌ Error processing PDF: {str(e)}")
-            st.markdown("""
-            **Troubleshooting:**
-            - Make sure the PDF isn't corrupted
-            - Check if the PDF requires a password
-            - Try a different bank statement format
-            """)
+            st.error(f"❌ Error processing PDF: {e}")
