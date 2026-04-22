@@ -6,3 +6,4 @@ pytesseract
 pdf2image
 numpy
 openpyxl
+pillow
